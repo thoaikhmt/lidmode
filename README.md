@@ -105,6 +105,22 @@ Power state is read from sysfs, including vendor charge thresholds, so a
 ThinkPad sitting at its 80% charge limit shows `holding 80% limit` rather than
 a misleading `Not charging`, and USB-C ports are not mistaken for mains power.
 
+## Packaging notes
+
+If you package Lid Mode for a sandboxed distribution, two facts matter:
+
+- The app detects `/.flatpak-info` and then calls
+  `org.freedesktop.login1.Manager.Inhibit()` over the system bus, holding the
+  returned file descriptor while server mode is on. This is what `systemd-inhibit`
+  does internally.
+- `org.freedesktop.portal.Inhibit` cannot replace that call: its `suspend` flag
+  produces a `block-weak` logind inhibitor, which logind ignores when it
+  performs the lid action.
+
+The desktop entry, icon and AppStream metadata are in `data/` and install into
+the usual XDG locations, so a sandboxed build only needs to copy them and the
+two scripts.
+
 ## Caveats
 
 - **Heat.** A closed laptop still vents. Keep it on a hard surface with the
