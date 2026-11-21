@@ -98,6 +98,16 @@ In both cases the screen is untouched: Mutter switches the panel off on lid
 close and GNOME still locks/blanks on idle. The CPU, network and your processes
 keep running.
 
+### Why the Flatpak needs system bus access
+
+`--system-talk-name=org.freedesktop.login1` exists solely to call
+`Manager.Inhibit("handle-lid-switch:idle:sleep", "block")`. There is no portal
+that can prevent a lid-close suspend: `org.freedesktop.portal.Inhibit` with the
+`suspend` flag produces a **weak** logind inhibitor (`block-weak`), which logind
+ignores when it performs the lid action. The app requests no filesystem,
+network, device or session-bus access beyond Wayland/X11, IPC and DRI for
+rendering, and it makes no other logind calls.
+
 Power state is read from sysfs, including vendor charge thresholds, so a
 ThinkPad sitting at its 80% charge limit shows `holding 80% limit` rather than
 a misleading `Not charging`, and USB-C ports are not mistaken for mains power.
