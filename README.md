@@ -16,16 +16,19 @@ servers stay alive.
 
 ## Install
 
-### Flatpak (development build)
+Requires Python 3 with PyGObject, GTK 4 and libadwaita (the default on Fedora,
+Ubuntu, Debian, Arch GNOME installs), plus systemd/logind.
+
+### From a release tarball
+
+Download `lidmode-<version>.tar.gz` from
+[Releases](https://github.com/thoaikhmt/lidmode/releases), then:
 
 ```bash
-flatpak install flathub org.flatpak.Builder org.gnome.Platform//51 org.gnome.Sdk//51
-flatpak run --command=flatpak-builder org.flatpak.Builder \
-  --user --install --force-clean build-dir \
-  flatpak/io.github.thoaikhmt.LidMode.yml
+tar xf lidmode-*.tar.gz
+cd lidmode-*/
+./install.sh
 ```
-
-(Once the Flathub submission is merged: `flatpak install flathub io.github.thoaikhmt.LidMode`.)
 
 ### From source
 
@@ -35,9 +38,9 @@ cd lidmode
 ./install.sh
 ```
 
-This symlinks `lidmode` and `lidmode-app` into `~/.local/bin` and installs the
-desktop entry, icon and AppStream metadata for the current user. Remove the
-shortcuts with `./install.sh --uninstall`.
+`install.sh` symlinks `lidmode` and `lidmode-app` into `~/.local/bin` and
+installs the desktop entry, icon and AppStream metadata for the current user.
+Remove the shortcuts with `./install.sh --uninstall`.
 
 ## Use the app
 
@@ -49,11 +52,11 @@ Launch **Lid Mode** from the app grid:
   state.
 - A banner when it's on, and a battery warning when it's on and unplugged.
 
-In the Flatpak build the app holds the inhibitor itself, so **closing the window
-keeps it running in the background** while server mode is on; quitting the app
-(reopening it, then menu → Quit) turns server mode off.
+Closing the window does not stop server mode: the app keeps running in the
+background while the inhibitor is held. Reopen it from the app grid to switch it
+off, or use the CLI.
 
-## Use the CLI (source installs)
+## Use the CLI
 
 ```bash
 lidmode on            # until you turn it off
@@ -85,28 +88,18 @@ Suggested shortcut: Settings → Keyboard → Custom Shortcuts →
 
 ## How it works
 
-- **Source installs:** `lidmode on` starts a transient `systemd --user` unit
+- **Normal installs:** `lidmode on` starts a transient `systemd --user` unit
   running `systemd-inhibit --what=handle-lid-switch:idle:sleep --mode=block
   sleep infinity`. The unit is not enabled at boot and disappears when you turn
   server mode off.
-- **Flatpak:** the app calls `org.freedesktop.login1.Manager.Inhibit()` on the
-  system bus and keeps the returned file descriptor open (the same mechanism
-  `systemd-inhibit` uses). The sandbox needs
-  `--system-talk-name=org.freedesktop.login1` for this.
+- **Sandboxed builds:** if the app detects `/.flatpak-info`, it calls
+  `org.freedesktop.login1.Manager.Inhibit()` over the system bus and keeps the
+  returned file descriptor open — the same mechanism `systemd-inhibit` uses.
+  Such a build needs `--system-talk-name=org.freedesktop.login1`.
 
-In both cases the screen is untouched: Mutter switches the panel off on lid
-close and GNOME still locks/blanks on idle. The CPU, network and your processes
-keep running.
-
-### Why the Flatpak needs system bus access
-
-`--system-talk-name=org.freedesktop.login1` exists solely to call
-`Manager.Inhibit("handle-lid-switch:idle:sleep", "block")`. There is no portal
-that can prevent a lid-close suspend: `org.freedesktop.portal.Inhibit` with the
-`suspend` flag produces a **weak** logind inhibitor (`block-weak`), which logind
-ignores when it performs the lid action. The app requests no filesystem,
-network, device or session-bus access beyond Wayland/X11, IPC and DRI for
-rendering, and it makes no other logind calls.
+The screen is untouched either way: Mutter switches the panel off on lid close
+and GNOME still locks/blanks on idle. The CPU, network and your processes keep
+running.
 
 Power state is read from sysfs, including vendor charge thresholds, so a
 ThinkPad sitting at its 80% charge limit shows `holding 80% limit` rather than
@@ -118,47 +111,29 @@ a misleading `Not charging`, and USB-C ports are not mistaken for mains power.
   vents clear; don't leave it running closed inside a bag.
 - **Battery.** Server mode does not stop the battery from draining; the app
   warns when you enable it on battery.
-- **Session lifetime.** Source installs: the inhibitor lives in your user
-  systemd manager, so it ends on logout/reboot. Flatpak: it ends when the app
-  quits.
+- **Session lifetime.** The inhibitor lives in your user systemd manager (or in
+  the app process for sandboxed builds), so it ends on logout/reboot or when the
+  app quits.
 - **Reboot.** Not persistent by design — turn server mode on again after
   rebooting.
 - Manual suspend is blocked while server mode is on.
 
-## Packaging (Flathub)
-
-Layout:
+## Repository layout
 
 ```
-bin/lidmode                        CLI + logind/systemd logic (source installs)
-bin/lidmode-app                    GTK4/libadwaita GUI (both backends)
+bin/lidmode                 CLI + systemd/logind logic
+bin/lidmode-app             GTK4/libadwaita GUI
 data/io.github.thoaikhmt.LidMode.desktop
 data/io.github.thoaikhmt.LidMode.metainfo.xml
 data/icons/hicolor/scalable/apps/io.github.thoaikhmt.LidMode.svg
 data/screenshots/{on,off}.png
-flatpak/io.github.thoaikhmt.LidMode.yml
 install.sh
 ```
 
-Checks:
-
-```bash
-appstreamcli validate --no-net data/io.github.thoaikhmt.LidMode.metainfo.xml
-desktop-file-validate data/io.github.thoaikhmt.LidMode.desktop
-python3 -m py_compile bin/lidmode-app
-bash -n bin/lidmode
-```
-
-Submitting to Flathub (after pushing a release tag):
-
-1. Fork `flathub/flathub` and create a branch from `new-pr`:
-   `git checkout -b lidmode new-pr`.
-2. Copy `flatpak/io.github.thoaikhmt.LidMode.yml` into the fork's root.
-3. Commit, push, and open a PR against `flathub/flathub:new-pr`.
-4. Answer the review bot: the app ID is verified via GitHub (`io.github.thoaikhmt`),
-   the source tag must exist, and the build must pass `flatpak-builder`.
-   Flathub builds with `org.gnome.Platform//51`; no extra modules are needed
-   because PyGObject/GTK/libadwaita come from the runtime.
+There is deliberately no Flatpak manifest in this repository. If you want to
+package Lid Mode yourself, the app exposes everything a sandboxed build needs
+(the logind backend and the `/.flatpak-info` detection) and its AppStream
+metadata and desktop entry are ready to be installed under `/app`.
 
 ## License
 

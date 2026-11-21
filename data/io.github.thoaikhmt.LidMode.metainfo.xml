@@ -71,6 +71,11 @@
   </branding>
 
   <releases>
+    <release version="1.3.1" date="2026-11-21">
+      <description>
+        <p>Source-only release with a cleaner repository layout and release tarball.</p>
+      </description>
+    </release>
     <release version="1.3.0" date="2026-11-21">
       <description>
         <p>Initial release: toggle 24/7 server mode with a logind inhibitor.</p>
