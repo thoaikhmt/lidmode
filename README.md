@@ -1,5 +1,9 @@
 # Lid Mode
 
+<p align="center">
+  <img src="data/icon.png" width="112" alt="Lid Mode icon">
+</p>
+
 Turn a Linux laptop into a small always-on machine: with **server mode** on,
 closing the lid switches the screen off but the computer keeps running — no
 suspend, no idle sleep — so SSH sessions, downloads, builds and background
