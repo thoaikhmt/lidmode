@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.thoaikhmt.LidMode</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+
+  <name>Lid Mode</name>
+  <summary>Keep your laptop running with the lid closed</summary>
+
+  <description>
+    <p>
+      Lid Mode turns your laptop into a small always-on machine. Switch server
+      mode on and close the lid: the screen turns off, but the computer keeps
+      running, so SSH sessions, downloads, builds and background servers stay
+      alive.
+    </p>
+    <p>
+      It works by holding a logind inhibitor for the lid switch, idle time and
+      suspend, so neither closing the lid nor the desktop's automatic suspend
+      can put the machine to sleep. Nothing is installed as a boot service and
+      nothing changes permanently: switch it off and the laptop behaves
+      normally again.
+    </p>
+    <p>
+      Server mode can run until you turn it off, or for a chosen number of
+      hours. While it is on, a warning appears if you are running on battery,
+      since a closed lid keeps draining it. Closing the window keeps Lid Mode
+      running in the background; quitting it turns server mode off.
+    </p>
+  </description>
+
+  <launchable type="desktop-id">io.github.thoaikhmt.LidMode.desktop</launchable>
+
+  <url type="homepage">https://github.com/thoaikhmt/lidmode</url>
+  <url type="bugtracker">https://github.com/thoaikhmt/lidmode/issues</url>
+  <url type="vcs-browser">https://github.com/thoaikhmt/lidmode</url>
+
+  <developer id="io.github.thoaikhmt">
+    <name>thoaikhmt</name>
+  </developer>
+
+  <content_rating type="oars-1.1"/>
+
+  <categories>
+    <category>Utility</category>
+  </categories>
+
+  <keywords>
+    <keyword>lid</keyword>
+    <keyword>suspend</keyword>
+    <keyword>sleep</keyword>
+    <keyword>server</keyword>
+    <keyword>awake</keyword>
+    <keyword>power</keyword>
+  </keywords>
+
+  <screenshots>
+    <screenshot type="default">
+      <image>https://raw.githubusercontent.com/thoaikhmt/lidmode/main/data/screenshots/on.png</image>
+      <caption>Server mode on — safe to close the lid</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/thoaikhmt/lidmode/main/data/screenshots/off.png</image>
+      <caption>Server mode off — normal laptop behaviour</caption>
+    </screenshot>
+  </screenshots>
+
+  <branding>
+    <color type="primary" scheme_preference="light">#3f3e44</color>
+    <color type="primary" scheme_preference="dark">#3f3e44</color>
+  </branding>
+
+  <releases>
+    <release version="1.3.0" date="2026-11-21">
+      <description>
+        <p>Initial release: toggle 24/7 server mode with a logind inhibitor.</p>
+      </description>
+    </release>
+  </releases>
+
+  <requires>
+    <display_length compare="ge">360</display_length>
+  </requires>
+</component>

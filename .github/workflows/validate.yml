@@ -1,0 +1,26 @@
+name: validate
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  metadata:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install validation tools
+        run: sudo apt-get update && sudo apt-get install -y appstream desktop-file-utils
+
+      - name: Validate AppStream metadata
+        run: appstreamcli validate --no-net data/io.github.thoaikhmt.LidMode.metainfo.xml
+
+      - name: Validate desktop entry
+        run: desktop-file-validate data/io.github.thoaikhmt.LidMode.desktop
+
+      - name: Check Python syntax
+        run: python3 -m py_compile bin/lidmode-app
+
+      - name: Check shell syntax
+        run: bash -n bin/lidmode install.sh

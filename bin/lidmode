@@ -1,0 +1,415 @@
+#!/usr/bin/env bash
+# lidmode — toggle "24/7 server mode": keep this machine running with the lid closed.
+#
+#   on   : a transient systemd --user unit holds a logind block inhibitor for
+#          handle-lid-switch + idle + sleep, so neither the lid nor the GNOME
+#          idle timer can suspend the machine. Auto-expires after DURATION.
+#   off  : stops the unit; normal laptop behaviour returns (lid close = suspend).
+#
+# No root required, nothing persistent is written outside ~/.local/state/lidmode.
+set -uo pipefail
+
+PROG=${0##*/}
+UNIT=lidmode-awake.service
+LEGACY_UNIT=keep-laptop-awake.service
+STATE_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/lidmode
+STATE_FILE=$STATE_DIR/state
+DEFAULT_DURATION=forever
+WHAT=handle-lid-switch:idle:sleep
+WHY="server mode: keep running with the lid closed"
+
+if [[ -t 1 && -z ${NO_COLOR:-} ]]; then
+    C_ON=$'\033[1;32m' C_OFF=$'\033[2m' C_ACC=$'\033[1;36m' C_WARN=$'\033[1;33m' C_RST=$'\033[0m'
+else
+    C_ON='' C_OFF='' C_ACC='' C_WARN='' C_RST=''
+fi
+
+die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
+note() { printf '%s\n' "$*" >&2; }
+
+usage() {
+    cat <<EOF
+Usage: $PROG <command> [duration]
+
+Commands:
+  on [duration]   Enable server mode (default: forever)
+  off             Disable server mode, restore normal lid behaviour
+  toggle          Flip the current state
+  status [--json] Show state and machine details
+
+Duration: number of seconds, or a value like 30m, 8h, 1d, 1h30m, or "forever".
+EOF
+}
+
+require_session() {
+    [[ -n ${XDG_RUNTIME_DIR:-} ]] || die "no user systemd session (XDG_RUNTIME_DIR unset); run this inside your desktop session"
+    systemctl --user show-environment >/dev/null 2>&1 || die "cannot reach the user systemd manager"
+}
+
+# ---------- durations ----------
+
+parse_duration() {
+    local d=${1,,} total=0 part n u
+    case $d in
+    '' | default) parse_duration "$DEFAULT_DURATION"; return ;;
+    forever | infinite | inf | never | always | 0) printf '0'; return ;;
+    esac
+    if [[ $d =~ ^[0-9]+$ ]]; then
+        printf '%s' "$d"
+        return
+    fi
+    [[ $d =~ ^([0-9]+[smhd])+$ ]] || return 1
+    while IFS= read -r part; do
+        n=${part%?}
+        u=${part: -1}
+        case $u in
+        s) total=$((total + n)) ;;
+        m) total=$((total + n * 60)) ;;
+        h) total=$((total + n * 3600)) ;;
+        d) total=$((total + n * 86400)) ;;
+        esac
+    done < <(grep -oE '[0-9]+[smhd]' <<<"$d")
+    printf '%s' "$total"
+}
+
+human_duration() {
+    local s=$1 d h m
+    if ((s <= 0)); then
+        printf 'forever'
+        return
+    fi
+    d=$((s / 86400))
+    h=$(((s % 86400) / 3600))
+    m=$(((s % 3600) / 60))
+    if ((d > 0)); then
+        printf '%dd %dh' "$d" "$h"
+    elif ((h > 0)); then
+        printf '%dh %dm' "$h" "$m"
+    elif ((m > 0)); then
+        printf '%dm' "$m"
+    else
+        printf '%ds' "$s"
+    fi
+}
+
+# ---------- unit helpers ----------
+
+unit_active() { systemctl --user is-active --quiet "$UNIT" 2>/dev/null; }
+unit_load_state() { systemctl --user show -p LoadState --value "$UNIT" 2>/dev/null; }
+
+stop_unit() {
+    systemctl --user stop "$UNIT" >/dev/null 2>&1 || true
+    systemctl --user reset-failed "$UNIT" >/dev/null 2>&1 || true
+    local i
+    for i in {1..40}; do
+        [[ $(unit_load_state) == not-found ]] && return 0
+        sleep 0.05
+    done
+    return 0
+}
+
+# ---------- state ----------
+
+state_load() {
+    STATE_STARTED=0
+    STATE_EXPIRES=0
+    STATE_DURATION=0
+    [[ -r $STATE_FILE ]] || return 0
+    local k v
+    while IFS='=' read -r k v; do
+        [[ $v =~ ^[0-9]+$ ]] || continue
+        case $k in
+        started_at) STATE_STARTED=$v ;;
+        expires_at) STATE_EXPIRES=$v ;;
+        duration_secs) STATE_DURATION=$v ;;
+        esac
+    done <"$STATE_FILE"
+}
+
+state_save() {
+    mkdir -p "$STATE_DIR" || return 1
+    printf 'started_at=%s\nexpires_at=%s\nduration_secs=%s\n' "$1" "$2" "$3" >"$STATE_FILE.tmp" &&
+        mv "$STATE_FILE.tmp" "$STATE_FILE"
+}
+
+state_clear() { rm -f "$STATE_FILE" "$STATE_FILE.tmp" 2>/dev/null; }
+
+# ---------- machine info ----------
+
+power_source() {
+    local d
+    # Only a real mains supply counts as AC; a USB-C port with a device on it
+    # also exposes online=1 and must not be mistaken for the charger.
+    for d in /sys/class/power_supply/*; do
+        [[ -r $d/type && -r $d/online ]] || continue
+        [[ $(<"$d/type") == Mains ]] || continue
+        [[ $(<"$d/online") == 1 ]] && {
+            printf 'AC'
+            return
+        }
+    done
+    compgen -G '/sys/class/power_supply/BAT*' >/dev/null && {
+        printf 'Battery'
+        return
+    }
+    printf 'Unknown'
+}
+
+# Sets BATTERY_PCT and BATTERY_STATUS (weighted across batteries if there are several).
+battery_read() {
+    BATTERY_PCT=""
+    BATTERY_STATUS=""
+    local d now full cap sum_now=0 sum_full=0
+    for d in /sys/class/power_supply/BAT*; do
+        [[ -d $d ]] || continue
+        [[ -z $BATTERY_STATUS && -r $d/status ]] && BATTERY_STATUS=$(<"$d/status")
+        if [[ -r $d/energy_now && -r $d/energy_full ]]; then
+            now=$(<"$d/energy_now")
+            full=$(<"$d/energy_full")
+            sum_now=$((sum_now + now))
+            sum_full=$((sum_full + full))
+        elif [[ -r $d/charge_now && -r $d/charge_full ]]; then
+            now=$(<"$d/charge_now")
+            full=$(<"$d/charge_full")
+            sum_now=$((sum_now + now))
+            sum_full=$((sum_full + full))
+        elif [[ -z $BATTERY_PCT && -r $d/capacity ]]; then
+            BATTERY_PCT=$(<"$d/capacity")
+        fi
+    done
+    if ((sum_full > 0)); then
+        BATTERY_PCT=$((sum_now * 100 / sum_full))
+    fi
+}
+
+battery_percent() {
+    battery_read
+    printf '%s' "$BATTERY_PCT"
+}
+
+battery_status() {
+    battery_read
+    printf '%s' "$BATTERY_STATUS"
+}
+
+battery_threshold() {
+    local f
+    for f in /sys/class/power_supply/BAT*/charge_control_end_threshold; do
+        [[ -r $f ]] && {
+            printf '%s' "$(<"$f")"
+            return
+        }
+    done
+}
+
+# Human-readable charge state that accounts for vendor charge limits
+# (a ThinkPad sitting at its 80% limit reports "Not charging" in sysfs).
+charging_state() {
+    local source=$1 pct=$2 status=$3 threshold=$4
+    if [[ $source != AC ]]; then
+        printf 'discharging'
+        return
+    fi
+    case $status in
+    Charging)
+        printf 'charging'
+        return
+        ;;
+    Full)
+        printf 'charged'
+        return
+        ;;
+    esac
+    if [[ -n $threshold && -n $pct ]] && ((pct >= threshold - 1)); then
+        printf 'holding %s%% limit' "$threshold"
+        return
+    fi
+    case $status in
+    "Not charging") printf 'plugged in, not charging' ;;
+    "") printf 'plugged in' ;;
+    *) printf '%s' "${status,,}" ;;
+    esac
+}
+
+# One-line power summary, e.g. "AC · battery 79% (holding 80% limit)".
+power_line() {
+    local ps ch
+    ps=$(power_source)
+    battery_read
+    ch=$(charging_state "$ps" "$BATTERY_PCT" "$BATTERY_STATUS" "$(battery_threshold)")
+    if [[ -n $BATTERY_PCT ]]; then
+        printf '%s · battery %s%% (%s)' "$ps" "$BATTERY_PCT" "$ch"
+    else
+        printf '%s' "$ps"
+    fi
+}
+
+lid_state() {
+    local f
+    for f in /proc/acpi/button/lid/*/state; do
+        [[ -r $f ]] || continue
+        case $(<"$f") in
+        *closed*) printf 'closed' ;;
+        *) printf 'open' ;;
+        esac
+        return
+    done
+    printf 'unknown'
+}
+
+linger_state() { loginctl show-user "$USER" -p Linger --value 2>/dev/null || printf 'unknown'; }
+
+notify() {
+    [[ -n ${DBUS_SESSION_BUS_ADDRESS:-} ]] || return 0
+    command -v notify-send >/dev/null 2>&1 || return 0
+    notify-send -a lidmode -i lidmode "$1" "${2:-}" >/dev/null 2>&1 || true
+}
+
+# ---------- commands ----------
+
+cmd_on() {
+    require_session
+    local arg=${1:-$DEFAULT_DURATION} secs start expires sleep_arg desc
+    secs=$(parse_duration "$arg") || die "invalid duration '$arg' (try 90m, 8h, 24h, 1d or forever)"
+
+    systemctl --user stop "$LEGACY_UNIT" >/dev/null 2>&1 || true
+    stop_unit
+
+    start=$(date +%s)
+    if ((secs == 0)); then
+        expires=0
+        sleep_arg=infinity
+        desc="Server mode · forever"
+    else
+        expires=$((start + secs))
+        sleep_arg=$secs
+        desc="Server mode · $(human_duration "$secs")"
+    fi
+
+    local run_out
+    if ! run_out=$(systemd-run --user --collect --unit="$UNIT" --description="$desc" \
+        systemd-inhibit --what="$WHAT" --why="$WHY" --mode=block sleep "$sleep_arg" 2>&1); then
+        die "failed to start $UNIT: $run_out"
+    fi
+
+    state_save "$start" "$expires" "$secs" || note "warning: could not write $STATE_FILE"
+
+    local until_text expires_text
+    if ((expires > 0)); then
+        until_text="expires in $(human_duration "$secs") ($(date -d "@$expires" '+%a %d %b %H:%M'))"
+        expires_text="for $(human_duration "$secs")"
+    else
+        until_text="stays on until you turn it off"
+        expires_text="forever"
+    fi
+
+    printf '%s● Server mode ON%s — %s\n' "$C_ON" "$C_RST" "$until_text"
+    printf '  %-9s %s\n' "power" "$(power_line)"
+    printf '  %-9s %s\n' "hint" "close the lid — screen off, machine stays up"
+    printf '  %-9s %s\n' "off" "lidmode off"
+
+    [[ $(power_source) == Battery ]] && note "${C_WARN}warning:${C_RST} running on battery — closed-lid mode for $expires_text will drain it"
+
+    notify "Server mode on" "$until_text"
+    return 0
+}
+
+cmd_off() {
+    require_session
+    local was=0
+    unit_active && was=1
+    systemctl --user stop "$LEGACY_UNIT" >/dev/null 2>&1 || true
+    stop_unit
+    state_clear
+    if ((was)); then
+        printf '%s○ Server mode OFF%s — normal laptop behaviour restored (lid close suspends)\n' "$C_OFF" "$C_RST"
+        notify "Server mode off" "Lid close suspends again"
+    else
+        printf '%s○ Server mode already off%s — normal laptop behaviour\n' "$C_OFF" "$C_RST"
+    fi
+    return 0
+}
+
+cmd_status() {
+    state_load
+    local active=0 remaining=0 now
+    unit_active && active=1
+    now=$(date +%s)
+
+    if ((active)); then
+        if ((STATE_STARTED == 0)); then
+            STATE_STARTED=$(date -d "$(systemctl --user show -p ActiveEnterTimestamp --value "$UNIT" 2>/dev/null)" +%s 2>/dev/null || printf '0')
+        fi
+        if ((STATE_EXPIRES > 0)); then
+            remaining=$((STATE_EXPIRES - now))
+            ((remaining < 0)) && remaining=0
+        fi
+    else
+        state_clear
+        STATE_STARTED=0
+        STATE_EXPIRES=0
+        STATE_DURATION=0
+    fi
+
+    local ps bp bst ch lid ling
+    ps=$(power_source)
+    battery_read
+    bp=$BATTERY_PCT
+    bst=$BATTERY_STATUS
+    ch=$(charging_state "$ps" "$bp" "$bst" "$(battery_threshold)")
+    lid=$(lid_state)
+    ling=$(linger_state)
+
+    if [[ ${1:-} == --json || ${1:-} == -j ]]; then
+        local active_json=false bp_json=null
+        ((active)) && active_json=true
+        [[ -n $bp ]] && bp_json=$bp
+        printf '{"active": %s, "unit": "%s", "started_at": %d, "expires_at": %d, "remaining_secs": %d, "duration_secs": %d, "power_source": "%s", "battery_percent": %s, "battery_status": "%s", "charge_state": "%s", "lid": "%s", "linger": "%s"}\n' \
+            "$active_json" "$UNIT" "$STATE_STARTED" "$STATE_EXPIRES" "$remaining" "$STATE_DURATION" \
+            "$ps" "$bp_json" "$bst" "$ch" "$lid" "$ling"
+        return 0
+    fi
+
+    if ((active)); then
+        if ((STATE_EXPIRES > 0)); then
+            printf '%s● Server mode ON%s — expires in %s (%s)\n' \
+                "$C_ON" "$C_RST" "$(human_duration "$remaining")" "$(date -d "@$STATE_EXPIRES" '+%a %d %b %H:%M')"
+        else
+            printf '%s● Server mode ON%s — until you turn it off\n' "$C_ON" "$C_RST"
+        fi
+    else
+        printf '%s○ Server mode OFF%s — normal laptop behaviour (lid close suspends)\n' "$C_OFF" "$C_RST"
+    fi
+
+    printf '  %-9s %s\n' "power" "$ps${bp:+ · battery $bp% ($ch)}"
+    printf '  %-9s %s\n' "lid" "$lid"
+    if ((STATE_STARTED > 0)); then
+        printf '  %-9s %s\n' "since" "$(date -d "@$STATE_STARTED" '+%a %d %b %H:%M')"
+    fi
+    if ((active)); then
+        printf '  %-9s %s\n' "unit" "$UNIT"
+        [[ $ling == no ]] && printf '  %-9s %s\n' "linger" "disabled — server mode stops if you log out (see 'loginctl enable-linger')"
+    else
+        printf '  %-9s %s\n' "next" "lidmode on"
+    fi
+    return 0
+}
+
+cmd_toggle() {
+    require_session
+    if unit_active; then
+        cmd_off
+    else
+        cmd_on "${1:-$DEFAULT_DURATION}"
+    fi
+}
+
+case ${1:-} in
+on | enable | start) shift; cmd_on "${1:-}" ;;
+off | disable | stop) shift; cmd_off ;;
+toggle) shift; cmd_toggle "${1:-}" ;;
+status) shift; cmd_status "${1:-}" ;;
+-h | --help | help) usage ;;
+'') usage ;;
+*) die "unknown command '$1' (try: on, off, toggle, status)" ;;
+esac

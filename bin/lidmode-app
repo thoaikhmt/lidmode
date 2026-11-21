@@ -1,0 +1,642 @@
+#!/usr/bin/env python3
+"""Lid Mode — keep a Linux laptop running with the lid closed.
+
+With server mode on, a logind block inhibitor (lid switch + idle + sleep) keeps
+the machine awake; the screen still turns off when the lid closes.
+
+Two backends are supported:
+  * CLI backend (source installs): delegates to the `lidmode` script, which uses
+    a transient `systemd --user` unit.
+  * Local backend (Flatpak sandbox): talks to logind directly over the system
+    bus and holds the returned file descriptor while running.
+
+CLI-ish entry points (handy for keybindings, source installs):
+    lidmode-app --toggle [duration]
+    lidmode-app --on [duration]
+    lidmode-app --off
+    lidmode-app --status
+"""
+from __future__ import annotations
+
+import glob
+import json
+import os
+import shutil
+import subprocess
+import sys
+import threading
+import time
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
+
+APP_ID = "io.github.thoaikhmt.LidMode"
+APP_NAME = "Lid Mode"
+VERSION = "1.3.0"
+REFRESH_SECONDS = 20
+
+INHIBIT_WHAT = "handle-lid-switch:idle:sleep"
+INHIBIT_WHY = "Lid Mode: keep running with the lid closed"
+
+DURATIONS: list[tuple[str, int]] = [
+    ("1 hour", 3600),
+    ("4 hours", 4 * 3600),
+    ("8 hours", 8 * 3600),
+    ("24 hours", 24 * 3600),
+    ("Forever", 0),
+]
+DEFAULT_DURATION_INDEX = 4  # forever
+
+
+# --------------------------------------------------------------------------- #
+# System information (works inside the Flatpak sandbox too)
+# --------------------------------------------------------------------------- #
+def read_sysfs(path: str) -> str | None:
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return handle.read().strip()
+    except OSError:
+        return None
+
+
+def power_source() -> str:
+    for device in glob.glob("/sys/class/power_supply/*"):
+        if read_sysfs(f"{device}/type") != "Mains":
+            continue
+        if read_sysfs(f"{device}/online") == "1":
+            return "AC"
+    return "Battery" if glob.glob("/sys/class/power_supply/BAT*") else "Unknown"
+
+
+def battery_info() -> tuple[int | None, str, int | None]:
+    percent: int | None = None
+    status = ""
+    sum_now = sum_full = 0
+    threshold: int | None = None
+    for device in sorted(glob.glob("/sys/class/power_supply/BAT*")):
+        status = status or (read_sysfs(f"{device}/status") or "")
+        now = read_sysfs(f"{device}/energy_now")
+        full = read_sysfs(f"{device}/energy_full")
+        if now and full:
+            sum_now += int(now)
+            sum_full += int(full)
+        elif percent is None:
+            capacity = read_sysfs(f"{device}/capacity")
+            if capacity:
+                percent = int(capacity)
+        if threshold is None:
+            limit = read_sysfs(f"{device}/charge_control_end_threshold")
+            if limit:
+                threshold = int(limit)
+    if sum_full:
+        percent = round(sum_now * 100 / sum_full)
+    return percent, status, threshold
+
+
+def charge_state(source: str, percent: int | None, status: str, threshold: int | None) -> str:
+    if source != "AC":
+        return "discharging"
+    if status == "Charging":
+        return "charging"
+    if status == "Full":
+        return "charged"
+    if threshold and percent is not None and percent >= threshold - 1:
+        return f"holding {threshold}% limit"
+    if status == "Not charging":
+        return "plugged in, not charging"
+    return status.lower() or "plugged in"
+
+
+def lid_state() -> str:
+    for path in glob.glob("/proc/acpi/button/lid/*/state"):
+        state = read_sysfs(path) or ""
+        return "closed" if "closed" in state else "open"
+    return "unknown"
+
+
+def machine_status() -> dict:
+    source = power_source()
+    percent, status, threshold = battery_info()
+    return {
+        "power_source": source,
+        "battery_percent": percent,
+        "charge_state": charge_state(source, percent, status, threshold),
+        "lid": lid_state(),
+    }
+
+
+# --------------------------------------------------------------------------- #
+# CLI plumbing (source installs)
+# --------------------------------------------------------------------------- #
+def find_cli() -> str | None:
+    override = os.environ.get("LIDMODE_BIN")
+    if override and os.access(override, os.X_OK):
+        return override
+    here = os.path.dirname(os.path.realpath(__file__))
+    for candidate in (
+        os.path.join(here, "lidmode"),
+        os.path.join(os.path.dirname(here), "bin", "lidmode"),
+    ):
+        if os.access(candidate, os.X_OK):
+            return candidate
+    return shutil.which("lidmode")
+
+
+def run_cli(args: list[str], timeout: int = 20) -> tuple[int, str, str]:
+    cli = find_cli()
+    if not cli:
+        return 127, "", "the `lidmode` command was not found next to this app"
+    try:
+        proc = subprocess.run(
+            [cli, *args], capture_output=True, text=True, timeout=timeout
+        )
+        return proc.returncode, proc.stdout, proc.stderr
+    except subprocess.TimeoutExpired:
+        return 124, "", "lidmode timed out"
+    except OSError as exc:
+        return 1, "", str(exc)
+
+
+def human_seconds(seconds: int) -> str:
+    if seconds <= 0:
+        return "forever"
+    days, rest = divmod(seconds, 86400)
+    hours, rest = divmod(rest, 3600)
+    minutes = rest // 60
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m"
+    return f"{seconds}s"
+
+
+def fmt_when(epoch: int) -> str:
+    return time.strftime("%a %d %b %H:%M", time.localtime(epoch))
+
+
+# --------------------------------------------------------------------------- #
+# Backends
+# --------------------------------------------------------------------------- #
+class CliBackend:
+    """Uses the lidmode script (transient systemd --user unit)."""
+
+    name = "cli"
+
+    def __init__(self, app: Adw.Application) -> None:
+        self.app = app
+        self.on_change = None
+
+    def status(self) -> dict | None:
+        code, out, err = run_cli(["status", "--json"])
+        if code != 0:
+            raise RuntimeError(err.strip() or "could not read status")
+        return json.loads(out)
+
+    def enable(self, seconds: int) -> tuple[bool, str]:
+        args = ["on"] if seconds == 0 else ["on", str(seconds)]
+        code, _out, err = run_cli(args)
+        return code == 0, err.strip() or "Server mode on"
+
+    def disable(self) -> tuple[bool, str]:
+        code, _out, err = run_cli(["off"])
+        return code == 0, err.strip() or "Server mode off"
+
+
+class LocalBackend:
+    """Talks to logind directly and holds the inhibitor fd in-process (Flatpak)."""
+
+    name = "local"
+
+    def __init__(self, app: Adw.Application) -> None:
+        self.app = app
+        self.on_change = None
+        self.fd: int | None = None
+        self.started_at = 0
+        self.expires_at = 0
+        self._timer_id = 0
+        self._held = False
+
+    @property
+    def active(self) -> bool:
+        return self.fd is not None
+
+    def status(self) -> dict:
+        data = {
+            "active": self.active,
+            "started_at": self.started_at,
+            "expires_at": self.expires_at,
+        }
+        data.update(machine_status())
+        return data
+
+    def enable(self, seconds: int) -> tuple[bool, str]:
+        if self.active:
+            return True, "Server mode already on"
+        try:
+            bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+            reply, fdlist = bus.call_with_unix_fd_list_sync(
+                "org.freedesktop.login1",
+                "/org/freedesktop/login1",
+                "org.freedesktop.login1.Manager",
+                "Inhibit",
+                GLib.Variant("(ssss)", (INHIBIT_WHAT, APP_NAME, INHIBIT_WHY, "block")),
+                GLib.VariantType.new("(h)"),
+                Gio.DBusCallFlags.NONE,
+                -1,
+                Gio.UnixFDList(),
+                None,
+            )
+        except GLib.Error as exc:
+            return False, f"logind refused the inhibitor: {exc.message}"
+        fds = fdlist.steal_fds()
+        self.fd = fds[reply.unpack()[0]]
+        self.started_at = int(time.time())
+        self.expires_at = self.started_at + seconds if seconds else 0
+        if seconds:
+            self._timer_id = GLib.timeout_add_seconds(seconds, self._expire)
+        if not self._held:
+            self.app.hold()
+            self._held = True
+        if self.on_change:
+            self.on_change()
+        return True, "Server mode on"
+
+    def disable(self) -> tuple[bool, str]:
+        if not self.active:
+            return True, "Server mode already off"
+        self._release()
+        if self.on_change:
+            self.on_change()
+        return True, "Server mode off"
+
+    def _expire(self) -> bool:
+        self._timer_id = 0
+        self._release()
+        if self.on_change:
+            self.on_change()
+        return GLib.SOURCE_REMOVE
+
+    def _release(self) -> None:
+        if self._timer_id:
+            GLib.source_remove(self._timer_id)
+            self._timer_id = 0
+        if self.fd is not None:
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+            self.fd = None
+        self.started_at = 0
+        self.expires_at = 0
+        if self._held:
+            self.app.release()
+            self._held = False
+
+
+def make_backend(app: Adw.Application):
+    forced = os.environ.get("LIDMODE_BACKEND", "").lower()
+    if forced == "local" or (not forced and os.path.exists("/.flatpak-info")):
+        return LocalBackend(app)
+    if forced == "cli":
+        return CliBackend(app)
+    return CliBackend(app)
+
+
+# --------------------------------------------------------------------------- #
+# Window
+# --------------------------------------------------------------------------- #
+class LidModeWindow(Adw.ApplicationWindow):
+    def __init__(self, app: Adw.Application) -> None:
+        super().__init__(application=app, title=APP_NAME)
+        self.set_default_size(460, 640)
+        self.set_size_request(380, 480)
+        self.set_icon_name(APP_ID)
+
+        self.backend = app.backend
+        self.backend.on_change = self._on_backend_change
+        self.busy = False
+        self._switch_guard = False
+        self._loaded = False
+        self.status: dict = {}
+
+        self.toasts = Adw.ToastOverlay()
+        self.banner = Adw.Banner(revealed=False)
+        self.battery_banner = Adw.Banner(revealed=False)
+        self.battery_banner.add_css_class("warning")
+
+        self.page = Adw.PreferencesPage()
+        self._build_groups()
+
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        content.append(self.banner)
+        content.append(self.battery_banner)
+        content.append(self.page)
+        content.append(self._build_footer())
+
+        clamp = Adw.Clamp(maximum_size=560)
+        clamp.set_child(content)
+        self.toasts.set_child(clamp)
+
+        toolbar = Adw.ToolbarView()
+        toolbar.add_top_bar(self._build_header())
+        toolbar.set_content(self.toasts)
+        self.set_content(toolbar)
+
+        self._refresh()
+        GLib.timeout_add_seconds(REFRESH_SECONDS, self._tick)
+
+    # -- UI construction ---------------------------------------------------
+    def _build_header(self) -> Adw.HeaderBar:
+        header = Adw.HeaderBar()
+        header.set_title_widget(
+            Adw.WindowTitle(title=APP_NAME, subtitle="24/7 server mode")
+        )
+
+        refresh = Gtk.Button(icon_name="view-refresh-symbolic")
+        refresh.set_tooltip_text("Refresh status")
+        refresh.connect("clicked", lambda *_: self._refresh())
+        header.pack_start(refresh)
+
+        menu = Gio.Menu()
+        menu.append("About Lid Mode", "app.about")
+        menu.append("Quit", "app.quit")
+        button = Gtk.MenuButton(icon_name="open-menu-symbolic")
+        button.set_menu_model(menu)
+        button.set_tooltip_text("Main menu")
+        header.pack_end(button)
+        return header
+
+    def _build_groups(self) -> None:
+        self.mode_group = Adw.PreferencesGroup(title="Server mode")
+        self.switch_row = Adw.SwitchRow(
+            title="Keep running with the lid closed",
+            subtitle="Off — closing the lid suspends the laptop",
+        )
+        self.switch_row.connect("notify::active", self._on_switch)
+        self.mode_group.add(self.switch_row)
+
+        self.duration_row = Adw.ComboRow(
+            title="Duration",
+            subtitle="Applies the next time you switch server mode on",
+            model=Gtk.StringList.new([label for label, _ in DURATIONS]),
+        )
+        self.duration_row.set_selected(DEFAULT_DURATION_INDEX)
+        self.mode_group.add(self.duration_row)
+        self.page.add(self.mode_group)
+
+        self.status_group = Adw.PreferencesGroup(title="Status")
+        self.row_expires = Adw.ActionRow(title="Expires")
+        self.row_since = Adw.ActionRow(title="Enabled")
+        self.row_power = Adw.ActionRow(title="Power")
+        self.row_lid = Adw.ActionRow(title="Lid")
+        for row in (
+            self.row_expires,
+            self.row_since,
+            self.row_power,
+            self.row_lid,
+        ):
+            self.status_group.add(row)
+        self.page.add(self.status_group)
+
+    def _build_footer(self) -> Gtk.Label:
+        footer = Gtk.Label(
+            label=(
+                "Server mode holds a logind inhibitor (lid switch, idle, sleep) "
+                "so nothing can suspend the machine. The screen still turns off "
+                "when the lid closes."
+            ),
+            wrap=True,
+            xalign=0,
+            margin_top=4,
+            margin_bottom=18,
+            margin_start=18,
+            margin_end=18,
+        )
+        footer.add_css_class("dim-label")
+        footer.add_css_class("caption")
+        return footer
+
+    # -- state / refresh ---------------------------------------------------
+    def _tick(self) -> bool:
+        self._refresh()
+        return GLib.SOURCE_CONTINUE
+
+    def _on_backend_change(self) -> None:
+        GLib.idle_add(self._refresh)
+
+    def _refresh(self) -> None:
+        if self.busy:
+            return
+        if isinstance(self.backend, CliBackend) and find_cli() is None:
+            self._toast("The `lidmode` command was not found")
+            return
+        threading.Thread(target=self._refresh_worker, daemon=True).start()
+
+    def _refresh_worker(self) -> None:
+        try:
+            status = self.backend.status()
+        except (RuntimeError, json.JSONDecodeError, ValueError) as exc:
+            GLib.idle_add(self._toast, str(exc) or "could not read status")
+            return
+        GLib.idle_add(self._apply_status, status)
+
+    def _apply_status(self, status: dict) -> bool:
+        was_active = bool(self.status.get("active"))
+        self.status = status
+        active = bool(status.get("active"))
+
+        self._switch_guard = True
+        self.switch_row.set_active(active)
+        self._switch_guard = False
+        self.duration_row.set_sensitive(not active)
+
+        self.banner.set_revealed(active)
+        self.banner.set_title("Server mode is on — safe to close the lid")
+        if active:
+            self.switch_row.set_subtitle("On — safe to close the lid")
+            self.mode_group.set_description("Server mode is on — safe to close the lid.")
+            expires = status.get("expires_at") or 0
+            if expires:
+                remaining = max(0, int(expires) - int(time.time()))
+                self.row_expires.set_subtitle(
+                    f"in {human_seconds(remaining)} ({fmt_when(int(expires))})"
+                )
+            else:
+                self.row_expires.set_subtitle("Never — until you switch it off")
+            self.row_expires.set_visible(True)
+        else:
+            self.switch_row.set_subtitle("Off — closing the lid suspends the laptop")
+            self.mode_group.set_description(None)
+            self.row_expires.set_visible(False)
+
+        if status.get("started_at") and active:
+            self.row_since.set_subtitle(fmt_when(int(status["started_at"])))
+            self.row_since.set_visible(True)
+        else:
+            self.row_since.set_visible(False)
+
+        source = status.get("power_source") or "Unknown"
+        percent = status.get("battery_percent")
+        charge = status.get("charge_state") or ""
+        if percent is None:
+            self.row_power.set_subtitle(source)
+        else:
+            self.row_power.set_subtitle(f"{source} · {percent}% ({charge})")
+        if source == "Battery":
+            self.row_power.add_css_class("warning")
+        else:
+            self.row_power.remove_css_class("warning")
+
+        self.row_lid.set_subtitle((status.get("lid") or "unknown").capitalize())
+
+        self.battery_banner.set_revealed(active and source == "Battery")
+        self.battery_banner.set_title(
+            "Running on battery — closed-lid server mode will drain it"
+        )
+
+        if self._loaded:
+            if active and not was_active:
+                self._toast("Server mode on — safe to close the lid")
+            elif was_active and not active:
+                self._toast("Server mode ended — lid close suspends again")
+        self._loaded = True
+        return GLib.SOURCE_REMOVE
+
+    def _toast(self, message: str) -> bool:
+        self.toasts.add_toast(Adw.Toast(title=message, timeout=6))
+        return GLib.SOURCE_REMOVE
+
+    # -- actions -----------------------------------------------------------
+    def _on_switch(self, row: Adw.SwitchRow, _pspec) -> None:
+        if self._switch_guard or self.busy:
+            return
+        if row.get_active():
+            index = self.duration_row.get_selected()
+            seconds = DURATIONS[index][1] if index < len(DURATIONS) else 0
+            self._run(lambda: self.backend.enable(seconds), "Server mode on")
+        else:
+            self._run(self.backend.disable, "Server mode off")
+        row.set_sensitive(False)
+
+    def _set_busy(self, busy: bool) -> None:
+        self.busy = busy
+        self.switch_row.set_sensitive(not busy)
+        if not busy:
+            self.duration_row.set_sensitive(not bool(self.status.get("active")))
+
+    def _run(self, action, label: str) -> None:
+        if self.busy:
+            return
+        self._set_busy(True)
+
+        # The local backend touches GApplication's hold counter, so keep it on
+        # the main thread; the CLI backend shells out and can use a worker.
+        if isinstance(self.backend, LocalBackend):
+            try:
+                ok, message = action()
+            except Exception as exc:  # noqa: BLE001 - surfaced to the user
+                ok, message = False, str(exc)
+            self._done(ok, message, label)
+            return
+
+        def worker() -> None:
+            try:
+                ok, message = action()
+            except Exception as exc:  # noqa: BLE001 - surfaced to the user
+                ok, message = False, str(exc)
+            GLib.idle_add(self._done, ok, message, label)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _done(self, ok: bool, message: str, label: str) -> bool:
+        self._set_busy(False)
+        if ok:
+            self._toast(message or label)
+        else:
+            self._toast(message or f"{label} failed")
+        self._refresh()
+        return GLib.SOURCE_REMOVE
+
+
+# --------------------------------------------------------------------------- #
+# Application
+# --------------------------------------------------------------------------- #
+class LidModeApp(Adw.Application):
+    def __init__(self) -> None:
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
+        self.window: LidModeWindow | None = None
+        self.backend = make_backend(self)
+
+    def do_startup(self) -> None:
+        Adw.Application.do_startup(self)
+
+        about = Gio.SimpleAction.new("about", None)
+        about.connect("activate", self._show_about)
+        self.add_action(about)
+
+        quit_action = Gio.SimpleAction.new("quit", None)
+        quit_action.connect("activate", self._quit)
+        self.add_action(quit_action)
+        self.set_accels_for_action("app.quit", ["<primary>q"])
+
+    def do_activate(self) -> None:
+        if self.window is None:
+            self.window = LidModeWindow(self)
+            self.window.connect("close-request", self._on_close_request)
+        self.window.present()
+
+    def _on_close_request(self, _window) -> bool:
+        # While server mode is on the app keeps running in the background
+        # (GApplication hold), so the inhibitor stays alive.
+        self.window = None
+        return False
+
+    def _quit(self, *_args) -> None:
+        if isinstance(self.backend, LocalBackend):
+            self.backend.disable()
+        self.quit()
+
+    def _show_about(self, *_args) -> None:
+        about = Adw.AboutDialog(
+            application_name=APP_NAME,
+            application_icon=APP_ID,
+            version=VERSION,
+            developer_name="thoaikhmt",
+            comments=(
+                "Toggle 24/7 server mode: a logind inhibitor keeps this laptop "
+                "awake with the lid closed, for as long as you choose."
+            ),
+            website="https://github.com/thoaikhmt/lidmode",
+            license_type=Gtk.License.MIT_X11,
+        )
+        about.present(self.window)
+
+
+def quick_mode(argv: list[str]) -> int | None:
+    """Handle --toggle/--on/--off/--status without opening a window."""
+    if not argv or argv[0] not in {"--toggle", "--on", "--off", "--status"}:
+        return None
+    mapping = {"--toggle": "toggle", "--on": "on", "--off": "off", "--status": "status"}
+    code, out, err = run_cli([mapping[argv[0]], *argv[1:]])
+    if out:
+        sys.stdout.write(out if out.endswith("\n") else out + "\n")
+    if err:
+        sys.stderr.write(err if err.endswith("\n") else err + "\n")
+    return code
+
+
+def main() -> int:
+    result = quick_mode(sys.argv[1:])
+    if result is not None:
+        return result
+    app = LidModeApp()
+    return app.run(sys.argv)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

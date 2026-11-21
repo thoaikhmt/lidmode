@@ -1,0 +1,18 @@
+[Desktop Entry]
+Type=Application
+Name=Lid Mode
+GenericName=Server Mode
+Comment=Keep this laptop running with the lid closed
+Exec=lidmode-app
+Icon=io.github.thoaikhmt.LidMode
+Terminal=false
+Categories=Utility;
+Keywords=lid;suspend;sleep;server;awake;inhibit;power;
+StartupNotify=true
+StartupWMClass=io.github.thoaikhmt.LidMode
+X-GNOME-UsesNotifications=true
+Actions=Toggle;
+
+[Desktop Action Toggle]
+Name=Toggle Server Mode
+Exec=lidmode-app --toggle
