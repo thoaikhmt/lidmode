@@ -1,8 +1,4 @@
-# Lid Mode
-
-<p align="center">
-  <img src="data/icon.png" width="112" alt="Lid Mode icon">
-</p>
+# <img src="data/icon.png" width="48" alt="Lid Mode icon"> Lid Mode
 
 Turn a Linux laptop into a small always-on machine: with **server mode** on,
 closing the lid switches the screen off but the computer keeps running — no
